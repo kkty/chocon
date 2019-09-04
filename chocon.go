@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"runtime/pprof"
 	"syscall"
 	"time"
 
@@ -79,6 +80,20 @@ func main() {
 }
 
 func _main() int {
+	timer := time.NewTimer(time.Second * 10)
+	go func() {
+		<-timer.C
+		f, err := os.Create("/tmp/memprofile")
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer f.Close()
+		runtime.GC()
+		if err := pprof.WriteHeapProfile(f); err != nil {
+			log.Fatal(err)
+		}
+	}()
+
 	opts := cmdOpts{}
 	psr := flags.NewParser(&opts, flags.Default)
 	_, err := psr.Parse()

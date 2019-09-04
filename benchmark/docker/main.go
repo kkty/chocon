@@ -106,6 +106,14 @@ func (c *Container) Execute(command string, arg ...string) ([]byte, []byte, erro
 	return stdout.Bytes(), stderr.Bytes(), err
 }
 
+// Copy copies a file or a directory from container to host.
+func (c *Container) Copy(from, to string) error {
+	cmd := exec.Command("docker", "cp", fmt.Sprintf("%s:%s", c.Name, from), to)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
 func makeYaml(containers []*Container) ([]byte, error) {
 	m := make(map[string]interface{})
 
