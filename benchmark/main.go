@@ -207,6 +207,7 @@ func run(
 	responseTime := responseTimeSum / float64(success+fail)
 
 	if useChocon {
+		time.Sleep(time.Second * 20)
 		chocon, _ := compose.Container("chocon")
 		if err := chocon.Copy("/tmp/memprofile", "."); err != nil {
 			log.Fatal(err)

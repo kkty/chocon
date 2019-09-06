@@ -80,7 +80,8 @@ func main() {
 }
 
 func _main() int {
-	timer := time.NewTimer(time.Second * 10)
+	timer := time.NewTimer(time.Second * 20)
+
 	go func() {
 		<-timer.C
 		f, err := os.Create("/tmp/memprofile")
