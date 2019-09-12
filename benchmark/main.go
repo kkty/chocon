@@ -172,6 +172,10 @@ func run(
 		}
 	}
 
+	if _, _, err := clientContainer.Execute("/root/go/bin/hey", args...); err != nil {
+		return 0, 0, 0, err
+	}
+
 	stdout, _, err := clientContainer.Execute("/root/go/bin/hey", args...)
 
 	if err != nil {
