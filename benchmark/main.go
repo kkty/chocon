@@ -140,6 +140,7 @@ func run(
 		"-D", "./dummy",
 		"-c", strconv.Itoa(concurrency),
 		"-o", "csv",
+		"-m", "POST",
 	}
 
 	if duration != 0 {
