@@ -1,19 +1,27 @@
 package proxy
 
 import (
+	"bytes"
+	"context"
 	"errors"
+	"fmt"
+	"io"
+	"net"
 	"net/http"
-	"strings"
 
+	"github.com/kazeburo/chocon/upstream"
 	"github.com/rs/xid"
 	"github.com/valyala/fasthttp"
 	"go.uber.org/zap"
 )
 
 const (
-	proxyVerHeader                = "X-Chocon-Ver"
-	proxyIDHeader                 = "X-Chocon-Id"
 	httpStatusClientClosedRequest = 499
+)
+
+var (
+	proxyVerHeader = []byte("X-Chocon-Ver")
+	proxyIDHeader  = []byte("X-Chocon-Id")
 )
 
 // These headers won't be copied from original request to proxy request.
@@ -35,19 +43,21 @@ type Status struct {
 
 // Proxy : Provide host-based proxy server.
 type Proxy struct {
-	Version string
-	Client  *fasthttp.Client
-	logger  *zap.Logger
+	Version  string
+	Client   *fasthttp.Client
+	logger   *zap.Logger
+	upstream *upstream.Upstream
 }
 
 var errInvalidHostHeader = errors.New("invalid host value in header")
 
 // New sets up a proxy.
-func New(client *fasthttp.Client, version string, logger *zap.Logger) *Proxy {
+func New(client *fasthttp.Client, version string, logger *zap.Logger, upstream *upstream.Upstream) *Proxy {
 	return &Proxy{
-		Version: version,
-		Client:  client,
-		logger:  logger,
+		Version:  version,
+		Client:   client,
+		logger:   logger,
+		upstream: upstream,
 	}
 }
 
@@ -60,18 +70,16 @@ func rewriteHost(req *fasthttp.Request, originalReq *fasthttp.Request) error {
 	if len(originalReq.Host()) == 0 {
 		return errInvalidHostHeader
 	}
-
-	hostPortSplit := strings.Split(string(originalReq.Host()), ":")
-
+	hostPortSplit := bytes.Split(originalReq.Host(), []byte(":"))
 	host := hostPortSplit[0]
-	port := ""
+	port := []byte("")
 	if len(hostPortSplit) > 1 {
-		port = ":" + hostPortSplit[1]
+		port = append([]byte(":"), hostPortSplit[1]...)
 	}
-	hostSplit := strings.Split(host, ".")
+	hostSplit := bytes.Split(host, []byte("."))
 	lastPartIndex := 0
 	for i, hostPart := range hostSplit {
-		if hostPart == "ccnproxy-ssl" || hostPart == "ccnproxy-secure" || hostPart == "ccnproxy-https" || hostPart == "ccnproxy" {
+		if bytes.Equal(hostPart, []byte("ccnproxy-ssl")) || bytes.Equal(hostPart, []byte("ccnproxy-secure")) || bytes.Equal(hostPart, []byte("ccnproxy-https")) || bytes.Equal(hostPart, []byte("ccnproxy")) {
 			lastPartIndex = i
 		}
 	}
@@ -80,11 +88,10 @@ func rewriteHost(req *fasthttp.Request, originalReq *fasthttp.Request) error {
 		return errInvalidHostHeader
 	}
 
-	req.URI().SetHost(strings.Join(hostSplit[0:lastPartIndex], ".") + port)
-	req.SetHostBytes(req.URI().Host())
+	req.URI().SetHostBytes(append(bytes.Join(hostSplit[0:lastPartIndex], []byte(".")), port...))
 
-	if hostSplit[lastPartIndex] == "ccnproxy-https" || hostSplit[lastPartIndex] == "ccnproxy-secure" || hostSplit[lastPartIndex] == "ccnproxy-ssl" {
-		req.URI().SetScheme("https")
+	if bytes.Equal(hostSplit[lastPartIndex], []byte("ccnproxy-https")) || bytes.Equal(hostSplit[lastPartIndex], []byte("ccnproxy-secure")) || bytes.Equal(hostSplit[lastPartIndex], []byte("ccnproxy-ssl")) {
+		req.URI().SetSchemeBytes([]byte("https"))
 	}
 
 	return nil
@@ -94,12 +101,12 @@ func rewriteHost(req *fasthttp.Request, originalReq *fasthttp.Request) error {
 // makes a request to the target server, and sends its response
 // to the client.
 func (p *Proxy) Handler(ctx *fasthttp.RequestCtx) {
-	if len(ctx.Request.Header.Peek(proxyVerHeader)) > 0 {
+	if len(ctx.Request.Header.PeekBytes(proxyVerHeader)) > 0 {
 		ctx.SetStatusCode(http.StatusLoopDetected)
 		return
 	}
 
-	proxyID := ctx.Request.Header.Peek(proxyIDHeader)
+	proxyID := ctx.Request.Header.PeekBytes(proxyIDHeader)
 
 	if len(proxyID) == 0 {
 		// `xid.New().Bytes()` does not work as we want
@@ -107,26 +114,41 @@ func (p *Proxy) Handler(ctx *fasthttp.RequestCtx) {
 		proxyID = []byte(xid.New().String())
 	}
 
-	ctx.Response.Header.SetBytesV(proxyIDHeader, proxyID)
+	ctx.Response.Header.SetBytesKV(proxyIDHeader, proxyID)
+
+	req := fasthttp.AcquireRequest()
+	defer fasthttp.ReleaseRequest(req)
 
 	// Copy the original request with some tweaks.
-	req := fasthttp.AcquireRequest()
 	ctx.Request.CopyTo(req)
 	for _, n := range ignoredHeaderNames {
 		req.Header.DelBytes(n)
 	}
-	ctx.Request.Header.Set(proxyVerHeader, p.Version)
 
-	// Rewrite the request's host header.
-	if err := rewriteHost(req, &ctx.Request); err != nil {
-		// If the original request's host header is invalid, return 400.
-		ctx.SetStatusCode(fasthttp.StatusBadRequest)
-		return
+	if p.upstream.Enabled() {
+		h, ipwc, err := p.upstream.Get()
+		defer p.upstream.Release(ipwc)
+		if err != nil {
+			ctx.SetStatusCode(fasthttp.StatusBadGateway)
+			return
+		}
+		uri := req.URI()
+		uri.SetScheme(p.upstream.GetScheme())
+		uri.SetHost(h)
+	} else {
+		ctx.Request.Header.SetBytesK(proxyVerHeader, p.Version)
+
+		// Rewrite the request's host header.
+		if err := rewriteHost(req, &ctx.Request); err != nil {
+			// If the original request's host header is invalid, return 400.
+			ctx.SetStatusCode(fasthttp.StatusBadRequest)
+			return
+		}
 	}
 
 	// Make a request to the target server.
-
 	res := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseResponse(res)
 
 	if err := p.Client.Do(req, res); err != nil {
 		logger := p.logger.With(
@@ -137,15 +159,30 @@ func (p *Proxy) Handler(ctx *fasthttp.RequestCtx) {
 			zap.ByteString("proxy_id", proxyID),
 		)
 
-		// TODO: change the message depending on the type of error.
-		logger.Error("Error from proxy", zap.Error(err))
-	}
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			logger.Error("ErrorFromProxy", zap.Error(err))
+			ctx.SetStatusCode(fasthttp.StatusGatewayTimeout)
+		} else if err == context.Canceled || err == io.ErrUnexpectedEOF {
+			logger.Error("ErrorFromProxy",
+				zap.Error(fmt.Errorf("%v: seems client closed request", err)))
+			ctx.SetContentType("text/plain; charset=utf-8")
+			ctx.Response.Header.Set("x-content-type-options", "nosniff")
+			ctx.SetStatusCode(httpStatusClientClosedRequest)
+			ctx.WriteString("client closed request")
+		} else {
+			logger.Error("ErrorFromProxy", zap.Error(err))
+			ctx.SetStatusCode(fasthttp.StatusBadGateway)
+		}
 
-	fasthttp.ReleaseRequest(req)
+		return
+	}
 
 	// Copy the target server's response and sends it back to the client.
 	ctx.SetBody(res.Body())
 	ctx.SetStatusCode(res.StatusCode())
-
-	fasthttp.ReleaseResponse(res)
+	res.Header.VisitAll(func(k, v []byte) {
+		if !bytes.Equal([]byte(proxyIDHeader), k) {
+			ctx.Response.Header.SetBytesKV(k, v)
+		}
+	})
 }
